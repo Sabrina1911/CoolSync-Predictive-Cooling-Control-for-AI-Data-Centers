@@ -128,35 +128,6 @@ especially in Ontario and Alberta where grid demand becomes expensive during pea
 
 ---
 
-# Academic Alignment
-
-This project was developed as part of:
-
-## CSCN8020 — Reinforcement Learning Programming
-
-Focused on:
-
-* MDP
-* Bellman Equation
-* Q-learning
-* DQN implementation
-* Experience Replay
-* Target Networks
-
-## CSCN8040 — Case Studies in AI and Machine Learning
-
-Focused on:
-
-* Problem Statement
-* Literature Review
-* Hypothesis
-* Methodology
-* Results
-* Conclusions
-* Toyota Business Process (TBP)
-
----
-
 # Repository Structure
 
 ```text
