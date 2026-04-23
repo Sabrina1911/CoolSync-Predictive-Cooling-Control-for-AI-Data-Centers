@@ -1,16 +1,19 @@
 // src/sections/PrototypeDemoSection.jsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Section from "../components/Section";
 import Card from "../components/Card";
 import KpiCard from "../components/KpiCard";
 import AnimatedNumber from "../components/AnimatedNumber";
+import CalibrationPanel from "../components/CalibrationPanel";
 import {
   runSimulation,
   runConservativeSimulation,
   estimateTokensFromText,
   complexityClass,
+  classifyPromptRisk,
   compareRuns,
   buildObservedRunSummary,
+  buildComparisonNarrative,
   buildDecisionSupport,
   estimateLagFromPoints,
   buildTelemetryAlerts,
@@ -20,6 +23,7 @@ import { COOLSYNC_SCENARIOS, loadScenario, buildHeatTrace } from "../lib/scenari
 import { parseScheduleCsv, scheduleEventsToScenario, estimateClass as estimatePromptClass, BURST_CLASS_LABEL, BURST_CLASS_COLOR } from "../lib/scheduleParser";
 import { runPID, runCoordinated, runPIDConservative, PHYS, generateWorkload, tokensToBurstClass, BURST_PARAMS } from "../lib/physics";
 import { fetchDqnResults, checkBackendHealth } from "../lib/simulationAdapter";
+import { getTelemetryAcceptedColumnsText } from "../lib/telemetrySchema";
 import {
   calibrateRunAgainstTelemetry,
   getDefaultCalibrationState,
@@ -46,8 +50,12 @@ import {
 } from "recharts";
 import {
   Zap,
+  Play,
   SlidersHorizontal,
   Upload,
+  FileDown,
+  ToggleLeft,
+  ToggleRight,
 } from "lucide-react";
 
 const MODELS = ["Small Model", "Medium Model", "LLM-70B (Dense)", "MoE Model"];
@@ -67,6 +75,8 @@ const STRATEGY_LABEL = {
   reactive: "Reactive",
   coordinated: "Coordinated",
 };
+
+const TELEMETRY_ACCEPTED_COLUMNS = getTelemetryAcceptedColumnsText();
 
 // Example prompts per burst class (used for burst-class preset buttons and Add-row auto-fill)
 const EXAMPLE_PROMPTS = [
@@ -130,6 +140,21 @@ function formatCarbonImpact(value) {
   if (amount === 0) return "below 1 mgCO2e";
   if (Math.abs(amount) < 0.01) return `${(amount * 1000).toFixed(1)} mgCO2e`;
   return `${amount.toFixed(2)} gCO2e`;
+}
+
+function getExportTimestamp() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+
+  return [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    "_",
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds()),
+  ].join("");
 }
 
 function formatChartTime(t) {
@@ -262,6 +287,10 @@ function buildScenarioResults({ tokens, model, grid, calibrationState, capacityP
 }
 
 export default function PrototypeDemoSection() {
+  const panelBRef = useRef(null);
+  const guidedTimersRef = useRef([]);
+  const [isGuidedDemoRunning, setIsGuidedDemoRunning] = useState(false);
+
   const [prompt, setPrompt] = useState(
     "Summarize this report into 5 bullets and list key risks and mitigations."
   );
@@ -305,6 +334,7 @@ export default function PrototypeDemoSection() {
 
   const tokens = useMemo(() => estimateTokensFromText(prompt), [prompt]);
   const complexity = useMemo(() => complexityClass(tokens), [tokens]);
+  const promptRisk = useMemo(() => classifyPromptRisk(tokens, model), [tokens, model]);
   const defaultCalibration = useMemo(() => getDefaultCalibrationState(model), [model]);
 
   const hasTelemetry = telemetry?.points?.length > 0;
@@ -312,7 +342,7 @@ export default function PrototypeDemoSection() {
   const valueTypeLabel = useTelemetry ? "Observed" : "Estimated";
   const valueTypeMeta = useTelemetry
     ? "Observed telemetry view"
-    : "Modeled";
+    : "Published benchmark + model estimate";
   const topConfidenceLabel = useTelemetry
     ? "Model confidence: Higher (telemetry-adjusted)"
     : "Model confidence: Medium (simulation-based)";
@@ -375,6 +405,15 @@ export default function PrototypeDemoSection() {
     setUploadState("none");
     setCalibrationState(getDefaultCalibrationState(model));
   };
+
+  function clearGuidedTimers() {
+    guidedTimersRef.current.forEach((t) => clearTimeout(t));
+    guidedTimersRef.current = [];
+  }
+
+  useEffect(() => {
+    return () => clearGuidedTimers();
+  }, []);
 
   // Load CoolSync JSON heat trace when a CoolSync scenario is selected
   useEffect(() => {
@@ -607,12 +646,22 @@ export default function PrototypeDemoSection() {
     return compareRuns(simulationBaselineRun, simulationCoordinatedRun);
   }, [simulationBaselineRun, simulationCoordinatedRun]);
 
+  const comparisonNarrative = useMemo(() => {
+    return buildComparisonNarrative(comparison);
+  }, [comparison]);
+
   const derivedAlertsLog = useMemo(() => {
     if (useTelemetry) return telemetryAlerts;
     return activeResult?.alerts || [];
   }, [useTelemetry, telemetryAlerts, activeResult]);
 
   const visibleAlertsLog = alertsLog?.length ? alertsLog : derivedAlertsLog;
+
+  const execute = () => {
+    const nextActive =
+      strategy === "coordinated" ? mergedScenarioResults.coordinated : mergedScenarioResults.reactive;
+    setAlertsLog(nextActive?.alerts || []);
+  };
 
   const onUploadCsv = async (file) => {
     if (!file) return;
@@ -740,6 +789,63 @@ export default function PrototypeDemoSection() {
     }
   };
 
+  const runGuidedDemo = () => {
+    if (isGuidedDemoRunning) return;
+
+    setIsGuidedDemoRunning(true);
+    clearGuidedTimers();
+
+    clearTelemetry();
+    setTraceSource("simulation");
+    setStrategy("reactive");
+    setAlertsLog([]);
+
+    guidedTimersRef.current.push(
+      setTimeout(() => {
+        panelBRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 250)
+    );
+
+    const base = new Date();
+    const ts = (ms) => new Date(base.getTime() + ms).toTimeString().slice(0, 8);
+
+    const steps = [
+      {
+        t: 550,
+        action: () => setStrategy("reactive"),
+        msg: "Step 1/4: Reactive baseline loaded to show the initial cooling delay.",
+      },
+      {
+        t: 1200,
+        action: () => setStrategy("coordinated"),
+        msg: "Step 2/4: Coordinated mode enabled to reduce the modeled lag window.",
+      },
+      {
+        t: 2200,
+        msg: "Step 3/4: Upload telemetry to compare observed data with the estimate.",
+      },
+      {
+        t: 3200,
+        msg: "Step 4/4: Export the summary with labels for research, estimated, and observed values.",
+      },
+    ];
+
+    steps.forEach((s) => {
+      guidedTimersRef.current.push(
+        setTimeout(() => {
+          if (s.action) s.action();
+          setAlertsLog((prev) => [`[${ts(s.t)}] ${s.msg}`, ...prev]);
+        }, s.t)
+      );
+    });
+
+    guidedTimersRef.current.push(
+      setTimeout(() => {
+        setIsGuidedDemoRunning(false);
+      }, 4000)
+    );
+  };
+
   const applyScenarioPreset = (preset) => {
     if (!preset) return;
     setDqnResults(null);
@@ -831,6 +937,10 @@ export default function PrototypeDemoSection() {
 
   const activeRun = activeRunSummary;
 
+  const activeDecisionSupport = useTelemetry
+    ? telemetryDecisionSupport
+    : activeResult?.decisionSupport;
+
   const capacityAssessment = buildCapacityAssessment({
     capacityPlan,
     activeRun: activeRunSummary,
@@ -856,11 +966,17 @@ const carbonCardLabel = useTelemetry
   : "Estimated carbon impact";
 
 const carbonCardHint = useTelemetry
-  ? "Observed telemetry"
-  : "Per request";
+  ? "Observed telemetry trace; strategy savings are shown in the comparison below"
+  : "Modeled per-request carbon under the selected strategy";
 
   const activePreset =
     SCENARIO_PRESETS.find((preset) => preset.id === scenarioPresetId) ?? null;
+
+  const comparisonWhSaved = Math.max(
+    0,
+    Number(mergedScenarioResults.reactive?.metrics?.totalWhCurrent || 0) -
+      Number(mergedScenarioResults.coordinated?.metrics?.totalWhTarget || 0)
+  );
 
   const comparisonCo2eSaved = Math.max(
     0,
@@ -885,18 +1001,18 @@ const carbonCardHint = useTelemetry
   );
 
   const consoleSummaryItems = [
-    { label: "Estimated tokens", value: `${tokens}`, meta: "Modeled" },
-    { label: "Complexity", value: complexity, meta: "Prompt class" },
-    { label: "Strategy", value: STRATEGY_LABEL[strategy], meta: "Policy" },
+    { label: "Estimated tokens", value: `${tokens}`, meta: "Modeled workload estimate" },
+    { label: "Complexity", value: complexity, meta: "Modeled prompt class" },
+    { label: "Strategy", value: STRATEGY_LABEL[strategy], meta: "Decision policy view" },
     {
       label: "Trace source",
       value: TRACE_SOURCE_LABEL[traceSource],
       meta: useTelemetry ? "Observed telemetry active" : "Simulation active",
     },
     {
-      label: "Cooling overhead gap",
+      label: "Estimated cooling gap",
       value: `${(predictedOverheadDelta * 100).toFixed(0)} pp`,
-      meta: "Modeled",
+      meta: "Published benchmark + model estimate",
     },
   ];
 
@@ -950,22 +1066,121 @@ const carbonCardHint = useTelemetry
     return { time: "System", text: String(entry) };
   });
 
+  const controlTraceItems = [
+    {
+      label: "Selected mode",
+      value: STRATEGY_LABEL[strategy],
+      tone:
+        strategy === "coordinated"
+          ? "border-[#C9DCCB] bg-[#EEF5EF] text-[#1F7A3A]"
+          : "border-[#DDC8B2] bg-[#F6EFE8] text-[#B4691F]",
+    },
+    {
+      label: "Policy target",
+      value:
+        strategy === "coordinated"
+          ? "Pre-cool window opened"
+          : "Reactive cooling maintained",
+      tone: "border-[#D3D9D0] bg-[#F3F5F0] text-[#3A3A3A]",
+    },
+    {
+      label: "Expected effect",
+      value:
+        strategy === "coordinated"
+          ? "Modeled lag window reduced"
+          : "Modeled lag window remains exposed",
+      tone: "border-[#D3D9D0] bg-[#F3F5F0] text-[#3A3A3A]",
+    },
+  ];
 
   const downloadSampleTelemetry = () => {
-    const csv = [
-      "time_ms,facility_kw,rack_kw,server_kw,gpu_power_w,cpu_power_w,dram_power_w,nic_power_w,inlet_temp_c,cooling_kw,request_count,workload_tokens,prompt_type",
-      "0,20.1,16.2,14.8,120,35,18,5,24.1,5.3,1,800,summary",
-      "50,20.6,16.8,15.1,180,42,21,6,24.3,5.5,2,1600,code",
-      "100,21.4,17.5,15.9,240,48,24,7,24.8,6.0,3,2600,analysis",
-      "150,20.9,16.9,15.3,170,40,20,6,24.5,5.7,2,1700,summary",
-    ].join("\n");
+    const rows = [
+      [
+        "time_ms",
+        "facility_kw",
+        "rack_kw",
+        "server_kw",
+        "gpu_power_w",
+        "cpu_power_w",
+        "dram_power_w",
+        "nic_power_w",
+        "inlet_temp_c",
+        "cooling_kw",
+        "pump_kw",
+        "other_overhead_kw",
+        "water_lpm",
+        "prompt_type",
+        "request_count",
+        "tokens_per_request",
+      ],
+    ];
 
+    for (let i = 0; i <= 36; i++) {
+      const t = i * 50;
+      const prefill = t <= 300;
+      const decode = t > 300 && t <= 1400;
+
+      let gpuW = 110;
+      if (prefill) gpuW = 140 + 320 * Math.sin((Math.PI * t) / 300);
+      else if (decode) gpuW = 190 + 30 * Math.sin((Math.PI * (t - 300)) / 500);
+
+      const cpuW = prefill ? 76 : decode ? 58 : 42;
+      const dramW = prefill ? 34 : decode ? 28 : 18;
+      const nicW = decode ? 16 : 10;
+      const inlet = 24.2 + (gpuW - 120) / 400;
+      const coolingKw = t >= 550 ? 18 + ((gpuW - 120) / 400) * 10 : 18;
+      const pumpKw = t >= 550 ? 1.2 + ((gpuW - 120) / 400) * 1.4 : 1.1;
+      const otherOverheadKw = 0.9;
+      const serverKw = (gpuW + cpuW + dramW + nicW) / 1000;
+      const rackKw = serverKw * 1.08;
+      const facilityKw = rackKw + coolingKw + pumpKw + otherOverheadKw;
+      const waterLpm = 22 + Math.max(0, (gpuW - 120) / 40);
+
+      let promptType = "short_qa";
+      let requestCount = 2;
+      let tokensPerRequest = 180;
+
+      if (t >= 350 && t < 800) {
+        promptType = "long_summary";
+        requestCount = 6;
+        tokensPerRequest = 2200;
+      } else if (t >= 800 && t < 1200) {
+        promptType = "code_gen";
+        requestCount = 8;
+        tokensPerRequest = 3200;
+      } else if (t >= 1200) {
+        promptType = "mixed_burst";
+        requestCount = 10;
+        tokensPerRequest = 1500;
+      }
+
+      rows.push([
+        t,
+        facilityKw.toFixed(3),
+        rackKw.toFixed(3),
+        serverKw.toFixed(3),
+        Math.round(gpuW),
+        cpuW.toFixed(0),
+        dramW.toFixed(0),
+        nicW.toFixed(0),
+        inlet.toFixed(2),
+        coolingKw.toFixed(2),
+        pumpKw.toFixed(2),
+        otherOverheadKw.toFixed(2),
+        waterLpm.toFixed(1),
+        promptType,
+        requestCount,
+        tokensPerRequest,
+      ]);
+    }
+
+    const csv = rows.map((r) => r.join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
 
     const a = document.createElement("a");
     a.href = url;
-    a.download = "greeninference_sample_telemetry.csv";
+    a.download = "greeninference_valid_telemetry.csv";
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -991,25 +1206,129 @@ const carbonCardHint = useTelemetry
     URL.revokeObjectURL(url);
   };
 
+  const exportCsv = () => {
+    const m = activeMetrics;
+    const exportStamp = getExportTimestamp();
+
+    const rows = [
+      ["timestamp", new Date().toISOString()],
+      ["prompt", prompt.replace(/\s+/g, " ").trim()],
+      ["model", model],
+      ["trace_source", traceSource],
+      ["strategy", strategy],
+      ["grid_gCO2_per_kWh", String(grid)],
+      ["workload_flexibility", String(workloadFlexibility)],
+      ["value_type", useTelemetry ? "observed" : "estimated"],
+      ["data_source", useTelemetry ? "telemetry" : "simulation"],
+      ["model_basis", "published research benchmarks + modeled estimates"],
+      ["capacity_headroom_pct", String(capacityControls.headroomPct)],
+      ["capacity_oversubscription_mode", String(capacityControls.oversubscriptionMode)],
+      ["capacity_batching_mode", String(capacityControls.batchingMode)],
+      ["capacity_power_cap_mode", String(capacityControls.powerCapMode)],
+      ["tokens_est", String(m.tokens)],
+      ["complexity", complexity],
+      ["prompt_risk", promptRisk],
+      ["wh_per_token", String(m.whPerToken)],
+      ["base_compute_Wh", String(m.baseComputeWh)],
+      ["total_Wh_today", String(m.totalWhCurrent)],
+      ["total_Wh_target", String(m.totalWhTarget)],
+      ["saved_Wh", String(m.savedWh)],
+      ["co2e_g_today", String(m.co2e_g_current)],
+      ["co2e_g_target", String(m.co2e_g_target)],
+      ["saved_co2e_g", String(m.savedCo2e_g)],
+      ["cooling_overhead_today", String(m.overheadCurrent)],
+      ["cooling_overhead_target", String(m.overheadTarget)],
+      ["capacity_throughput_rps", String(capacityAssessment?.throughputRps ?? "")],
+      ["capacity_queue_delay_ms", String(capacityAssessment?.queueDelayMs ?? "")],
+      ["capacity_utilization_pct", String(capacityAssessment?.utilizationPct ?? "")],
+      ["capacity_pressure", String(capacityAssessment?.capacityPressure ?? "")],
+      ["reactive_peak_inlet", String(simulationBaselineRun?.peakInlet || "")],
+      ["coordinated_peak_inlet", String(simulationCoordinatedRun?.peakInlet || "")],
+      ["reactive_lag_ms", String(simulationBaselineRun?.lagMs || "")],
+      ["coordinated_lag_ms", String(simulationCoordinatedRun?.lagMs || "")],
+      ["telemetry_enabled", String(useTelemetry)],
+      ["telemetry_format", String(telemetry?.meta?.format || "none")],
+      ["telemetry_rows", String(telemetry?.meta?.rows || 0)],
+      ["telemetry_confidence", String(telemetry?.meta?.confidence || "none")],
+      [
+        "telemetry_peak_requests",
+        String(
+          telemetryWorkloadSummary?.peakRequests ??
+            telemetryMetrics?.workload?.peakRequests ??
+            ""
+        ),
+      ],
+      [
+        "telemetry_peak_workload_tokens",
+        String(
+          telemetryWorkloadSummary?.peakWorkloadTokens ??
+            telemetryMetrics?.workload?.peakWorkloadTokens ??
+            ""
+        ),
+      ],
+      [
+        "telemetry_dominant_prompt_type",
+        String(
+          telemetryWorkloadSummary?.dominantPromptType ??
+            telemetryMetrics?.workload?.dominantPromptType ??
+            ""
+        ),
+      ],
+      [
+        "telemetry_burst_risk",
+        String(
+          telemetryWorkloadSummary?.burstRisk ?? telemetryMetrics?.workload?.burstRisk ?? ""
+        ),
+      ],
+      ["comparison_peakInletReductionPct", String(comparison.peakInletReductionPct)],
+      ["comparison_lagReductionPct", String(comparison.lagReductionPct)],
+      ["comparison_coolingReductionPct", String(comparison.coolingReductionPct)],
+      ["comparison_stabilityImprovementPct", String(comparison.stabilityImprovementPct)],
+      ["policy_recommendation", String(activeDecisionSupport?.recommendation || "")],
+      ["policy_recommendationLevel", String(activeDecisionSupport?.recommendationLevel || "")],
+      [
+        "policy_detectedSignals",
+        String((activeDecisionSupport?.detectedSignals || []).join("; ")),
+      ],
+      ["policy_rationale", String((activeDecisionSupport?.rationale || []).join("; "))],
+      ["calibration_status", String(displayCalibrationState?.status || "")],
+      ["calibration_confidence", String(displayCalibrationState?.confidence || "")],
+    ];
+
+    const csv = rows
+      .map((r) => r.map((x) => `"${String(x).replaceAll('"', '""')}"`).join(","))
+      .join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `greeninference_transparency_${exportStamp}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <Section
       id="demo"
       eyebrow="Simulation"
-      title="Decision Console"
-      subtitle="Compare cooling timing, energy, and carbon impact"
+      title="Simulation"
+      subtitle="How cooling timing changes estimated energy and carbon impact"
     >
       <div className="simulation-disclaimer mb-4 rounded-[18px] border border-[rgba(120,140,120,0.2)] bg-[rgba(240,244,240,0.8)] px-4 py-3 text-[13px] text-[#2F3B2F] shadow-[0_8px_18px_rgba(56,96,68,0.04)]">
         <p>
-          Decision model uses:
+          This simulation combines:
           <span className="ml-2 inline-flex items-center rounded-full border border-[#C9DCCB] bg-[#EEF5EF] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[#1E7D3A]">
-            Benchmarks
+            Published research benchmarks
           </span>
           <span className="ml-2 inline-flex items-center rounded-full border border-[#E2C89E] bg-[#FFF4E5] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[#A15C00]">
-            System estimates
+            Modeled system estimates
           </span>
           <span className="ml-2 inline-flex items-center rounded-full border border-[#BDD0FF] bg-[#E8F0FF] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[#1F4FD8]">
-            Optional telemetry
+            Optional telemetry data
           </span>
         </p>
         <p className="mt-2 text-[12px] text-[#5E6A5F]">
@@ -1037,16 +1356,89 @@ const carbonCardHint = useTelemetry
         <StatusPill tone="sky">{topConfidenceLabel}</StatusPill>
       </div>
 
-      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[0.9fr_1.1fr]">
-        <Card className="demo-input-shell ds-card--secondary h-fit">
+      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+        <Card className="demo-input-shell ds-card--secondary h-fit lg:sticky lg:top-24">
           <div className="demo-left-shell">
             <div>
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-2">
                   <Zap className="text-[#7A7F54]" size={18} />
-                  <div className="font-semibold">Decision Inputs</div>
+                  <div className="font-semibold">Console Input</div>
                 </div>
 
+                <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                  <button
+                    onClick={runGuidedDemo}
+                    disabled={isGuidedDemoRunning}
+                    className={[
+                      "inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm transition",
+                      isGuidedDemoRunning
+                        ? "border-[#D3D9D0] bg-[#DDE4DA] text-[#3A3A3A] opacity-70 cursor-not-allowed"
+                        : "border-[#D3D9D0] bg-[#DDE4DA] text-[#262626] hover:bg-[#BFD98A]/45",
+                    ].join(" ")}
+                    type="button"
+                  >
+                    <Play size={16} className="text-[#6B7B48]" />
+                    {isGuidedDemoRunning ? "Running Demo..." : "Run Guided Demo"}
+                  </button>
+
+                  <button
+                    onClick={execute}
+                    className="inline-flex items-center gap-2 rounded-full border border-[#D3D9D0] bg-[#DDE4DA] px-4 py-2 text-sm text-[#262626] transition-colors hover:bg-[#BFD98A]/45"
+                    type="button"
+                  >
+                    <Play size={16} className="text-[#6B7B48]" />
+                    Run
+                  </button>
+
+                  <button
+                    onClick={exportCsv}
+                    className="inline-flex items-center gap-2 rounded-full border border-[#D3D9D0] bg-[#DDE4DA] px-4 py-2 text-sm text-[#262626] transition-colors hover:bg-[#F3F5F0]"
+                    type="button"
+                  >
+                    <FileDown size={16} className="text-[#5E7766]" />
+                    Export CSV
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <ModuleTag label="Prompt input" />
+                <ModuleTag label="Simulation view" />
+                <span className="demo-signal-chip inline-flex items-center rounded-full border border-[#D3D9D0] bg-[#DDE4DA] px-3 py-1 text-xs text-[#3A3A3A]">
+                  Data:
+                  <span className="ml-1 text-[#6B7B48]">{TRACE_SOURCE_LABEL[traceSource]}</span>
+                </span>
+                <span className="demo-signal-chip inline-flex items-center rounded-full border border-[#D3D9D0] bg-[#DDE4DA] px-3 py-1 text-xs text-[#3A3A3A]">
+                  Mode:
+                  <span className="ml-1 text-[#7A7F54]">{STRATEGY_LABEL[strategy]}</span>
+                </span>
+              </div>
+
+              <div className="demo-policy-trace-card demo-support-surface mt-4 rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[#262626]">Decision trace</div>
+                    <div className="mt-1 text-xs text-[#6F756E]">
+                      Request → Estimate → Policy → Cooling → Results
+                    </div>
+                  </div>
+                  <StatusPill tone="sky">Modeled view</StatusPill>
+                </div>
+
+                <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+                  {controlTraceItems.map((item) => (
+                    <div
+                      key={item.label}
+                      className={`demo-policy-trace-item rounded-xl border px-3 py-3 ${item.tone}`}
+                    >
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.12em] opacity-80">
+                        {item.label}
+                      </div>
+                      <div className="mt-2 text-sm font-semibold">{item.value}</div>
+                    </div>
+                  ))}
+                </div>
               </div>
 
               <div className="mt-4">
@@ -1089,30 +1481,21 @@ const carbonCardHint = useTelemetry
                 </div>
 
                 <div className="mt-2 text-xs text-[#6F756E]">
-                  Active preset: <span className="text-[#3A3A3A]">{activePreset?.label ?? "Custom prompt"}</span>
+                  Active preset: <span className="text-[#3A3A3A]">{activePreset?.label ?? "—"}</span>
                 </div>
 
                 {/* ── Prompt Schedule Panel ── */}
-                <div
-                  className={[
-                    "mt-3 rounded-2xl border p-3",
-                    scheduleEvents.length > 0 || addRowOpen
-                      ? "border-[#C7CDC5] bg-[#F3F5F0]"
-                      : "border-dashed border-[#E2E7DF] bg-[#FBFCFA] py-2",
-                  ].join(" ")}
-                >
+                <div className="mt-3 rounded-2xl border border-[#C7CDC5] bg-[#F3F5F0] p-3">
                   <div className="flex items-center justify-between gap-2">
                     <div className="text-xs font-semibold uppercase tracking-[0.1em] text-[#5F6B67]">
-                      Schedule
+                      Prompt Schedule
                       {scheduleSource && (
                         <span className="ml-2 rounded-full border border-[#D3D9D0] bg-[#E8ECE6] px-2 py-0.5 text-[10px] text-[#6A776F]">
                           {scheduleSource === "csv" ? "CSV" : "Scenario"}
                         </span>
                       )}
                       <span className="ml-2 text-[#9AA09A] normal-case font-normal">
-                        {scheduleEvents.length > 0
-                          ? `${scheduleEvents.length} event${scheduleEvents.length !== 1 ? "s" : ""}`
-                          : "Off"}
+                        {scheduleEvents.length} event{scheduleEvents.length !== 1 ? "s" : ""}
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
@@ -1270,16 +1653,18 @@ const carbonCardHint = useTelemetry
                       </table>
                     </div>
                   ) : (
-                    null
+                    <p className="mt-2 text-[11px] text-[#9AA09A]">
+                      No events yet. Select a [CoolSync] scenario, upload a CSV, or add rows manually.
+                    </p>
                   )}
                 </div>
 
                 {/* ── Schedule CSV Upload ── */}
                 <div className="mt-2">
-                  <label className="flex cursor-pointer items-center gap-2 rounded-2xl border border-dashed border-[#DCE3DA] bg-[#FBFCFA] px-3 py-1.5 text-xs text-[#6A776F] transition hover:border-[#A8B4A5] hover:bg-[#F3F5F0]">
+                  <label className="flex cursor-pointer items-center gap-2 rounded-2xl border border-dashed border-[#C7CDC5] bg-[#F8FAF8] px-3 py-2 text-xs text-[#6A776F] transition hover:border-[#A8B4A5] hover:bg-[#F3F5F0]">
                     <Upload size={13} className="shrink-0 text-[#7A7F54]" />
                     <span>
-                      Upload schedule CSV
+                      Upload Schedule CSV
                       <span className="ml-1 text-[#9AA09A]">(time_min, prompt, users)</span>
                     </span>
                     <input
@@ -1304,7 +1689,7 @@ const carbonCardHint = useTelemetry
                 />
               </div>
 
-              <div className="mt-4">
+              <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
                 <div className="demo-controls-card demo-support-surface rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
                   <div className="flex items-center gap-2 text-sm font-semibold">
                     <SlidersHorizontal size={16} className="text-[#5E7766]" />
@@ -1376,12 +1761,200 @@ const carbonCardHint = useTelemetry
                       </div>
                     </div>
 
+                    <div>
+                      <div className="text-xs text-[#6F756E]">Workload flexibility</div>
+                      <select
+                        value={workloadFlexibility}
+                        onChange={(e) => setWorkloadFlexibility(e.target.value)}
+                        className="mt-1 w-full rounded-xl border border-[#D3D9D0] bg-[#F3F5F0] p-2 text-sm text-[#262626]"
+                      >
+                        <option value="urgent">Urgent / needed now</option>
+                        <option value="flexible">Flexible / can wait</option>
+                      </select>
+                    </div>
+
+                    <div className="rounded-2xl border border-[#D3D9D0] bg-[#F3F5F0] p-3">
+                      <div className="text-xs text-[#6F756E]">System pressure</div>
+                      <div className="mt-1 text-sm font-semibold text-[#262626]">
+                        {capacityAssessment?.capacityPressure || "LOW"}
+                      </div>
+                      <div className="mt-1 text-xs text-[#6F756E]">
+                        {capacityAssessment?.throughputRps?.toFixed(3) || "0.000"} req/s,{" "}
+                        {capacityAssessment?.queueDelayMs || 0} ms waiting time
+                      </div>
+                    </div>
                   </div>
                 </div>
 
+                <div className="demo-support-grid grid grid-cols-2 gap-3">
+                  <div className="demo-stat-card rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                    <div className="text-xs text-[#6F756E]">Estimated tokens</div>
+                    <div className="mt-1 text-xl font-extrabold text-[#6B7B48]">{tokens}</div>
+                  </div>
+
+                  <div className="demo-stat-card rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                    <div className="text-xs text-[#6F756E]">Complexity</div>
+                    <div className="mt-1 text-xl font-extrabold text-[#7B8F4B]">{complexity}</div>
+                  </div>
+
+                  <div className="demo-stat-card rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                    <div className="text-xs text-[#6F756E]">Load risk</div>
+                    <div className="mt-1 text-xl font-extrabold text-[#7A7F54]">{promptRisk}</div>
+                  </div>
+
+                  <div className="demo-stat-card rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                    <div className="text-xs text-[#6F756E]">{valueTypeLabel} energy</div>
+                    <div className="mt-1 text-lg font-bold text-[#262626]">
+                      {activeRunSummary?.whPerRequest?.toFixed(3) || "0.000"} Wh
+                    </div>
+                    <div className="mt-1 text-xs text-[#6F756E]">
+                      Based on GPU power models and literature ranges
+                    </div>
+                  </div>
+
+                  <div className="demo-stat-card col-span-2 rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                    <div className="text-xs text-[#6F756E]">Estimated cooling gap</div>
+                    <div className="mt-1 text-lg font-bold text-[#262626]">
+                      {(predictedOverheadDelta * 100).toFixed(0)} percentage points
+                    </div>
+                    <div className="mt-1 text-xs text-[#6F756E]">
+                      {useTelemetry
+                        ? "Observed telemetry trace active"
+                        : "Published benchmark + simulation trace active"}
+                    </div>
+                  </div>
+                </div>
               </div>
 
-              <div className="mt-4 grid grid-cols-1 gap-3">
+              <div className="demo-telemetry-card demo-support-surface mt-4 rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Upload size={16} className="text-[#7A7F54]" />
+                    Telemetry input (CSV)
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      if (uploadState === "invalid") return;
+                      if (!hasTelemetry) return;
+                      setTraceSource((current) =>
+                        current === "telemetry" ? "simulation" : "telemetry"
+                      );
+                    }}
+                    className={[
+                      "inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition",
+                      uploadState === "invalid"
+                        ? "border-[#D8B8B2] bg-[#F2E5E2] text-[#7C5A53]"
+                        : "border-[#D3D9D0] text-[#3A3A3A]",
+                      hasTelemetry && uploadState !== "invalid"
+                        ? "bg-[#DDE4DA] hover:bg-[#BFD98A]/45"
+                        : "bg-[#DDE4DA] opacity-50 cursor-not-allowed",
+                    ].join(" ")}
+                    type="button"
+                  >
+                    {uploadState === "invalid" ? (
+                      <>
+                        <Upload size={16} className="text-[#7C5A53]" />
+                        Bad CSV
+                      </>
+                    ) : useTelemetry ? (
+                      <>
+                        <ToggleRight size={16} className="text-[#6B7B48]" />
+                        Telemetry active
+                      </>
+                    ) : (
+                      <>
+                        <ToggleLeft size={16} className="text-[#3A3A3A]" />
+                        Using simulation
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <input
+                    type="file"
+                    key={fileInputKey}
+                    accept=".csv,text/csv"
+                    onChange={(e) => onUploadCsv(e.target.files?.[0])}
+                    className="block w-full text-xs text-[#3A3A3A] file:mr-3 file:rounded-full file:border file:border-[#D3D9D0] file:bg-[#DDE4DA] file:px-4 file:py-2 file:text-xs file:text-[#3A3A3A] hover:file:bg-[#DDE4DA]"
+                  />
+
+                  <div className="whitespace-nowrap text-xs text-[#6F756E]">
+                    {telemetry?.meta?.format === "unknown" ? (
+                      <span className="text-[#B4691F]">Wrong columns</span>
+                    ) : hasTelemetry ? (
+                      <span className="text-[#5F6B67]">
+                        {telemetry.meta.format} | {telemetry.meta.rows} rows
+                      </span>
+                    ) : (
+                      <span>No file yet</span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-3 flex items-center justify-end gap-2">
+                  <button
+                    onClick={clearTelemetry}
+                    className="inline-flex items-center gap-2 rounded-full border border-[#D3D9D0] bg-[#DDE4DA] px-3 py-1.5 text-xs text-[#3A3A3A] hover:bg-[#DDE4DA]"
+                    type="button"
+                  >
+                    Clear data
+                  </button>
+
+                  <button
+                    onClick={downloadSampleTelemetry}
+                    className="inline-flex items-center gap-2 rounded-full border border-[#D3D9D0] bg-[#DDE4DA] px-3 py-1.5 text-xs text-[#3A3A3A] hover:bg-[#DDE4DA]"
+                    type="button"
+                  >
+                    <FileDown size={14} className="text-[#3A3A3A]" />
+                    Download sample CSV
+                  </button>
+
+                  <button
+                    onClick={downloadInvalidTelemetry}
+                    className="inline-flex items-center gap-2 rounded-full border border-[#D3D9D0] bg-[#DDE4DA] px-3 py-1.5 text-xs text-[#3A3A3A] hover:bg-[#DDE4DA]"
+                    type="button"
+                  >
+                    <FileDown size={14} className="text-[#3A3A3A]" />
+                    Download bad CSV
+                  </button>
+                </div>
+
+                {telemetry?.meta?.error && (
+                  <div className="mt-2 text-xs text-[#7A7F54]">{telemetry.meta.error}</div>
+                )}
+
+                <div className="mt-2 text-xs text-[#6F756E]">
+                  Accepted columns:{" "}
+                  {TELEMETRY_ACCEPTED_COLUMNS.map((columns, index) => (
+                    <span key={columns}>
+                      <span className="text-[#3A3A3A]">{columns}</span>
+                      {index < TELEMETRY_ACCEPTED_COLUMNS.length - 1 ? " OR " : ""}
+                    </span>
+                  ))}
+                </div>
+
+                {hasTelemetry && telemetryWorkloadSummary?.hasBurstSignals && (
+                  <div className="mt-3 rounded-xl border border-[#C9DCCB] bg-[#EEF5EF] px-3 py-3 text-xs text-[#35563D]">
+                    <div className="font-semibold text-[#1F7A3A]">
+                      Concurrent request signal detected
+                    </div>
+                    <div className="mt-1">
+                      {telemetryBurstNarrative ||
+                        "Telemetry includes request burst fields for multi-user workload analysis."}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {uploadState === "invalid" && (
+                <div className="mt-3 rounded-lg border border-[#D8B8B2] bg-[#F2E5E2] px-3 py-2 text-xs text-[#7C5A53]">
+                  CSV invalid → simulation estimate remains active
+                </div>
+              )}
+
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <KpiCard
                   label={`${valueTypeLabel} energy`}
                   value={
@@ -1412,7 +1985,7 @@ const carbonCardHint = useTelemetry
                   hint={
                     useTelemetry
                       ? "Derived from uploaded telemetry"
-                      : "Modeled"
+                      : "Cooling share benchmark typically falls in the 30–50% range"
                   }
                   badge={useTelemetry ? "Observed" : "Estimated"}
                   accent="teal"
@@ -1466,16 +2039,38 @@ const carbonCardHint = useTelemetry
                   </div>
                 </div>
               )}
+
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="demo-result-strip demo-saving-card rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                  <div className="text-xs text-[#6F756E]">Modeled energy difference</div>
+                  <div className="mt-1 text-lg font-bold text-[#8BC34A]">
+                    {comparisonWhSaved.toFixed(3)} Wh
+                  </div>
+                  <div className="mt-1 text-xs text-[#6F756E]">
+                    Reactive estimate compared with coordinated estimate
+                  </div>
+                </div>
+
+                <div className="demo-result-strip demo-saving-card rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-3">
+                  <div className="text-xs text-[#6F756E]">Modeled carbon difference</div>
+                  <div className="mt-1 text-lg font-bold text-[#5E7766]">
+                    {formatCarbonImpact(comparisonCo2eSaved)}
+                  </div>
+                  <div className="mt-1 text-xs text-[#6F756E]">
+                    Better timing can reduce estimated carbon impact
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </Card>
 
-        <div>
+        <div ref={panelBRef}>
           <Card className="demo-output-shell ds-card--primary">
             <div>
               <div className="flex flex-wrap items-center gap-2">
                 <Zap className="text-[#5F6B67]" size={18} />
-                <div className="font-semibold">Decision Output</div>
+                <div className="font-semibold">Console Output</div>
 
                 <div className="ml-0 text-xs text-[#6F756E] sm:ml-2">
                   Trace: <span className="text-[#3A3A3A]">{TRACE_SOURCE_LABEL[traceSource]}</span>
@@ -1500,6 +2095,43 @@ const carbonCardHint = useTelemetry
                   <div>
                     <div className="text-sm font-semibold text-[#262626]">
                       Thermal vs cooling over time
+                    </div>
+                    <div className="mt-1 text-xs text-[#6F756E]">
+                      Problem graph: heat rises first and cooling responds after.
+                    </div>
+                  </div>
+                  <StatusPill tone="sky">Comparison view</StatusPill>
+                </div>
+
+                <p className="mt-3 rounded-xl border border-[#D3D9D0] bg-[#F3F5F0] px-3 py-2 text-xs text-[#5E6A5F]">
+                  Heat rises before cooling catches up. This is the coordination gap the system is trying to solve.
+                </p>
+
+                <div className="demo-proof-banner mt-3">
+                  Coordinated cooling reduces delay and stabilizes temperature under load.
+                </div>
+
+                <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="demo-proof-card rounded-2xl border border-[#C9DCCB] bg-[#F7FAF5] p-3 shadow-[0_10px_24px_rgba(34,197,94,0.10)]">
+                    <div className="card-heading text-xs">Modeled cooling delay reduction</div>
+                    <div className="mt-1 text-2xl font-black text-[#166534]">
+                      {comparison.lagReductionPct.toFixed(1)}%
+                    </div>
+                    <div className="kpi-delta mt-1">
+                      {baselineRun?.lagMs} ms → {coordinatedRun?.lagMs} ms
+                    </div>
+                    <div className="card-subtext mt-1 text-xs">
+                      Based on simulated workload conditions
+                    </div>
+                  </div>
+
+                  <div className="demo-support-card rounded-2xl border border-[#D3D9D0] bg-[#F3F5F0] p-3">
+                    <div className="text-xs text-[#6F756E]">Modeled peak temperature reduction</div>
+                    <div className="mt-1 text-xl font-extrabold text-[#8BC34A]">
+                      {comparison.peakInletReductionPct.toFixed(1)}%
+                    </div>
+                    <div className="mt-1 text-xs text-[#6F756E]">
+                      {baselineRun?.peakInlet?.toFixed(2)}°C → {coordinatedRun?.peakInlet?.toFixed(2)}°C
                     </div>
                   </div>
                 </div>
@@ -1845,6 +2477,119 @@ const carbonCardHint = useTelemetry
                 </div>
               )}
 
+              <div className="mt-4 rounded-2xl border border-[#C9DCCB] bg-[#F7FAF5] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[#1F2D22]">Research context</div>
+                    <div className="mt-1 text-xs text-[#5E6A5F]">
+                      Context used to ground the simulation and the decision-support narrative.
+                    </div>
+                  </div>
+                  <StatusPill tone="emerald">Research-backed</StatusPill>
+                </div>
+
+                <ul className="mt-3 space-y-2 text-sm text-[#2D3A2D]">
+                  <li className="rounded-xl border border-[#D3D9D0] bg-white/70 px-3 py-2">
+                    Cooling accounts for ~30–50% of total data center energy use.
+                  </li>
+                  <li className="rounded-xl border border-[#D3D9D0] bg-white/70 px-3 py-2">
+                    Coordinated cooling can reduce thermal lag and improve efficiency.
+                  </li>
+                  <li className="rounded-xl border border-[#D3D9D0] bg-white/70 px-3 py-2">
+                    Data centers are among the most energy-intensive digital infrastructures.
+                  </li>
+                </ul>
+              </div>
+
+              <div className="demo-insight-card demo-recommendation-card mt-4 rounded-2xl border border-[rgba(180,105,31,0.22)] bg-[#FFF7EE] p-4 shadow-[0_10px_24px_rgba(180,105,31,0.08)]">
+                <div className="text-sm font-bold text-[#8A5923]">&#9888; Recommended</div>
+                <div className="mt-2 text-xs text-[#8A5923]">Recommended action (modeled)</div>
+
+                <div className="mt-3 space-y-2 text-sm text-[#3A3A3A]">
+                  {comparisonNarrative.slice(0, 3).map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="demo-recommendation-item rounded-xl border border-[#D3D9D0] bg-[#F3F5F0] px-3 py-2"
+                    >
+                      {item}
+                    </div>
+                  ))}
+                  <div className="demo-recommendation-item rounded-xl border border-[#D3D9D0] bg-[#F3F5F0] px-3 py-2">
+                    Coordinated mode is recommended for this workload profile.
+                  </div>
+                  {useTelemetry && telemetryWorkloadSummary?.hasBurstSignals && (
+                    <div className="demo-recommendation-item rounded-xl border border-[#D3D9D0] bg-[#F3F5F0] px-3 py-2">
+                      Concurrent prompt bursts are visible in telemetry, so workload shaping or
+                      pre-cooling should be considered before peak demand windows.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-4 rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[#262626]">Telemetry and calibration</div>
+                    <div className="mt-1 text-xs text-[#6F756E]">
+                      Uploaded data can adjust the estimate and increase confidence.
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusPill tone={useTelemetry ? "emerald" : "amber"}>
+                      {useTelemetry ? "Observed + calibrated" : "Estimated view"}
+                    </StatusPill>
+                    <StatusPill tone="slate">
+                      {displayCalibrationState?.status || "UNCALIBRATED"}
+                    </StatusPill>
+                  </div>
+                </div>
+
+                {useTelemetry && (
+                  <div className="mt-3 rounded-xl border border-[#BDD0FF] bg-[#E8F0FF] px-3 py-2 text-xs text-[#1F4FD8]">
+                    Observed values are derived from uploaded telemetry data.
+                  </div>
+                )}
+
+                <div className="mt-4">
+                  <CalibrationPanel calibrationState={displayCalibrationState} />
+                </div>
+              </div>
+
+              <div className="limit-box demo-limit-card mt-4 rounded-2xl p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div className="limit-title text-sm">Console limits</div>
+                  <StatusPill tone="amber">Important note</StatusPill>
+                </div>
+                <div className="grid grid-cols-1 gap-2 text-sm">
+                  <div className="demo-limit-item rounded-xl border border-[rgba(198,122,43,0.18)] bg-[#FFF9F2] px-3 py-2">
+                    Building control and cooling system are not connected.
+                  </div>
+                  <div className="demo-limit-item rounded-xl border border-[rgba(198,122,43,0.18)] bg-[#FFF9F2] px-3 py-2">
+                    Telemetry comes from CSV upload only.
+                  </div>
+                  <div className="demo-limit-item rounded-xl border border-[rgba(198,122,43,0.18)] bg-[#FFF9F2] px-3 py-2">
+                    Recommendations are rule-based for this demo.
+                  </div>
+                </div>
+              </div>
+
+              <div className="demo-event-log-card mt-4 rounded-2xl border border-[#D3D9D0] bg-[#F6F7F3] p-4">
+                <div className="card-heading text-sm">Event log</div>
+                <div className="card-muted mt-1 text-xs">
+                  Recent system activity from the current run or uploaded telemetry.
+                </div>
+                <div className="mt-3 space-y-2 text-sm">
+                  {eventLogItems.slice(0, 6).map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="event-log-item demo-event-log-item rounded-xl border border-[#D3D9D0] bg-[#F3F5F0] px-3 py-2"
+                    >
+                      <div className="event-time">{item.time}</div>
+                      <div className="event-text mt-1">{item.text}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </Card>
         </div>
